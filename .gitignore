@@ -28,3 +28,10 @@ benchmarks/*
 # Optional local notes/notebooks (uncomment if desired)
 # notebooks/
 # notes/
+
+# Generated binaries/artifacts
+**/__pycache__/
+infer/l2r/
+
+# Nested external repo (keep unmanaged here)
+benchmarks/scripts/convexAdam/
