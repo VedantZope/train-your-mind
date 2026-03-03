@@ -9,15 +9,16 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import zipfile
 from pathlib import Path
 
 import torch
 from fireants.io.image import BatchedImages, Image
 from fireants.io.imagemask import apply_mask_to_image
+from fireants.io.keypoints import BatchedKeypoints, Keypoints, compute_keypoint_distance
 from fireants.registration.greedy import GreedyRegistration
 
-from mind.utils.io import mind_descriptor_image_convex
+from mind.evotorch.model import build_model
+from mind.utils.io import image_from_tensor_like, load_keypoints_csv, mind_descriptor_image_convex
 
 
 def _extract_case4(path_str: str) -> str:
@@ -39,44 +40,93 @@ def _load_pairs(dataset_json: Path, split_key: str) -> list[dict[str, str]]:
     return pairs
 
 
-def _resolve_pair_paths(nlst_root: Path, pair: dict[str, str]) -> tuple[Path, Path, Path | None, Path | None]:
-    fixed_rel = pair["fixed"]
-    moving_rel = pair["moving"]
-    fixed = (nlst_root / fixed_rel).resolve()
-    moving = (nlst_root / moving_rel).resolve()
+def _resolve_registration_val_paths(
+    nlst_root: Path, pair: dict[str, str], image_dir_name: str
+) -> tuple[Path, Path, Path, Path, Path | None, Path | None]:
+    fixed_name = Path(pair["fixed"]).name
+    moving_name = Path(pair["moving"]).name
 
-    fixed_mask = None
-    moving_mask = None
-    if "imagesTr" in fixed_rel:
-        fixed_mask = (nlst_root / fixed_rel.replace("imagesTr", "masksTr")).resolve()
-        moving_mask = (nlst_root / moving_rel.replace("imagesTr", "masksTr")).resolve()
-    elif "imagesTs" in fixed_rel:
-        fixed_mask = (nlst_root / fixed_rel.replace("imagesTs", "masksTs")).resolve()
-        moving_mask = (nlst_root / moving_rel.replace("imagesTs", "masksTs")).resolve()
+    fixed_img = (nlst_root / image_dir_name / fixed_name).resolve()
+    moving_img = (nlst_root / image_dir_name / moving_name).resolve()
+    fixed_kp = (nlst_root / "keypointsTr" / f"{Path(fixed_name).stem.replace('.nii', '')}.csv").resolve()
+    moving_kp = (nlst_root / "keypointsTr" / f"{Path(moving_name).stem.replace('.nii', '')}.csv").resolve()
+    fixed_mask = (nlst_root / "masksTr" / fixed_name).resolve()
+    moving_mask = (nlst_root / "masksTr" / moving_name).resolve()
+    return fixed_img, moving_img, fixed_kp, moving_kp, fixed_mask, moving_mask
 
-    return fixed, moving, fixed_mask, moving_mask
+
+def _load_model_from_weights(weights_path: Path) -> torch.nn.Module:
+    run_dir = weights_path.parent
+    if run_dir.name == "checkpoints":
+        run_dir = run_dir.parent
+    cfg_path = run_dir / "model_config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Missing model_config.json next to weights: {cfg_path}")
+    with cfg_path.open("r") as f:
+        cfg = json.load(f)
+    model_name = cfg.get("model_name", "basic")
+    model_params = cfg.get("model_params", {})
+    model, _model_cfgs, _ = build_model(model_name, model_params)
+    state = torch.load(str(weights_path), map_location="cpu")
+    model.load_state_dict(state)
+    model.eval()
+    return model
+
+
+def _feature_image_model(model: torch.nn.Module, src_img: Image, device: str) -> Image:
+    model = model.to(device)
+    with torch.no_grad():
+        tensor = src_img.array.float()
+        if tensor.shape[1] > 1:
+            tensor = tensor[:, :1]
+        feat = model(tensor)
+    return image_from_tensor_like(src_img, feat)
 
 
 def run_export(
     nlst_root: Path,
     dataset_json: Path,
-    split_key: str,
     out_dir: Path,
     masked: bool,
-    use_mind: bool,
+    image_dir_name: str,
+    feature_mode: str,
+    model_weights: Path | None,
     cc_kernel_size: int,
     smooth_warp_sigma: float,
     smooth_grad_sigma: float,
     downsample_scale: int,
-    make_zip: bool,
+    print_tre: bool,
 ) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    pairs = _load_pairs(dataset_json, split_key)
+    pairs = _load_pairs(dataset_json, "registration_val")
     out_dir.mkdir(parents=True, exist_ok=True)
+    model: torch.nn.Module | None = None
+    if feature_mode == "learned":
+        if model_weights is None:
+            raise ValueError("--model-weights is required when --feature-mode learned")
+        model = _load_model_from_weights(model_weights).to(device).eval()
 
     for idx, pair in enumerate(pairs, start=1):
-        fixed_path, moving_path, fixed_mask_path, moving_mask_path = _resolve_pair_paths(nlst_root, pair)
+        (
+            fixed_path,
+            moving_path,
+            fixed_kp_path,
+            moving_kp_path,
+            fixed_mask_path,
+            moving_mask_path,
+        ) = _resolve_registration_val_paths(nlst_root, pair, image_dir_name=image_dir_name)
+
+        if not fixed_path.exists() or not moving_path.exists():
+            raise FileNotFoundError(
+                f"Image file missing for pair {pair}: {fixed_path} / {moving_path}"
+            )
+        if print_tre and (not fixed_kp_path.exists() or not moving_kp_path.exists()):
+            print(
+                f"[WARN] Missing keypoints for TRE print: {fixed_kp_path} / {moving_kp_path}"
+            )
+            fixed_kp_path = None
+            moving_kp_path = None
 
         fixed_img = Image.load_file(str(fixed_path), device=device)
         moving_img = Image.load_file(str(moving_path), device=device)
@@ -84,9 +134,14 @@ def run_export(
         fixed_in = fixed_img
         moving_in = moving_img
 
-        if use_mind:
+        if feature_mode == "mind":
             fixed_in = mind_descriptor_image_convex(fixed_in)
             moving_in = mind_descriptor_image_convex(moving_in)
+        elif feature_mode == "learned":
+            if model is None:
+                raise RuntimeError("learned mode requested but model is not initialized")
+            fixed_in = _feature_image_model(model, fixed_in, device)
+            moving_in = _feature_image_model(model, moving_in, device)
 
         if masked:
             if fixed_mask_path is None or moving_mask_path is None:
@@ -114,6 +169,25 @@ def run_export(
         )
         reg.optimize()
 
+        tre_suffix = ""
+        if print_tre and fixed_kp_path is not None and moving_kp_path is not None:
+            fixed_pts = load_keypoints_csv(fixed_kp_path).astype("float32")
+            moving_pts = load_keypoints_csv(moving_kp_path).astype("float32")
+            fixed_kp = Keypoints(fixed_pts, fixed_img, device=device, space="pixel")
+            moving_kp = Keypoints(moving_pts, moving_img, device=device, space="pixel")
+            fixed_kp_batch = BatchedKeypoints([fixed_kp])
+            moving_kp_batch = BatchedKeypoints([moving_kp])
+            initial_dist = compute_keypoint_distance(
+                fixed_kp_batch, moving_kp_batch, space="physical", reduction="mean"
+            ).item()
+            moved_kp_batch = reg.evaluate_keypoints(fixed_kp_batch, moving_kp_batch)
+            final_dist = compute_keypoint_distance(
+                moved_kp_batch, moving_kp_batch, space="physical", reduction="mean"
+            ).item()
+            tre_suffix = f" | TRE init={initial_dist:.4f} final={final_dist:.4f}"
+        elif print_tre:
+            tre_suffix = " | TRE unavailable (no keypoints for this split/pair)"
+
         fixed_case4 = _extract_case4(pair["fixed"])
         moving_case4 = _extract_case4(pair["moving"])
         out_name = f"disp_{fixed_case4}_{moving_case4}.nii.gz"
@@ -125,15 +199,7 @@ def run_export(
             dtype=torch.float32,
         )
 
-        print(f"[{idx}/{len(pairs)}] saved {out_path.name}")
-
-    if make_zip:
-        zip_path = out_dir.with_suffix(".zip")
-        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for p in sorted(out_dir.glob("disp_*.nii.gz")):
-                zf.write(p, arcname=f"{out_dir.name}/{p.name}")
-        print(f"[DONE] zip written: {zip_path}")
-
+        print(f"[{idx}/{len(pairs)}] saved {out_path.name}{tre_suffix}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export NLST Learn2Reg submission fields")
@@ -150,10 +216,10 @@ if __name__ == "__main__":
         help="Path to NLST_dataset.json (default: <nlst-root>/NLST_dataset.json)",
     )
     parser.add_argument(
-        "--split",
-        choices=["registration_val", "registration_test"],
-        default="registration_val",
-        help="Which pair list from dataset json to export",
+        "--image-dir",
+        type=str,
+        default="imagesProcessedTr",
+        help="Image folder to read registration_val pairs from (default: imagesProcessedTr)",
     )
     parser.add_argument(
         "--out-dir",
@@ -163,29 +229,49 @@ if __name__ == "__main__":
     )
     parser.add_argument("--masked", action="store_true", help="Use masked_cc")
     parser.add_argument(
+        "--feature-mode",
+        choices=["mind", "intensity", "learned"],
+        default="mind",
+        help="Feature mode for registration input",
+    )
+    parser.add_argument(
+        "--model-weights",
+        type=Path,
+        default=None,
+        help="Path to learned model checkpoint (.pt/.pth); required for --feature-mode learned",
+    )
+    parser.add_argument(
         "--no-mind",
         action="store_true",
-        help="Disable MIND descriptor and register raw intensity",
+        help="Backward-compat: equivalent to --feature-mode intensity",
     )
     parser.add_argument("--cc-kernel-size", type=int, default=19)
     parser.add_argument("--smooth-warp-sigma", type=float, default=0.943661231295491)
     parser.add_argument("--smooth-grad-sigma", type=float, default=3.977854595777292)
     parser.add_argument("--downsample-scale", type=int, default=1)
-    parser.add_argument("--zip", action="store_true", help="Also create <out-dir>.zip")
+    parser.add_argument(
+        "--print-tre",
+        action="store_true",
+        help="Print per-pair initial/final TRE in terminal when keypoints are available",
+    )
     args = parser.parse_args()
 
     dataset_json = args.dataset_json or (args.nlst_root / "NLST_dataset.json")
+    feature_mode = args.feature_mode
+    if args.no_mind:
+        feature_mode = "intensity"
 
     run_export(
         nlst_root=args.nlst_root,
         dataset_json=dataset_json,
-        split_key=args.split,
         out_dir=args.out_dir,
         masked=args.masked,
-        use_mind=not args.no_mind,
+        image_dir_name=args.image_dir,
+        feature_mode=feature_mode,
+        model_weights=args.model_weights,
         cc_kernel_size=args.cc_kernel_size,
         smooth_warp_sigma=args.smooth_warp_sigma,
         smooth_grad_sigma=args.smooth_grad_sigma,
         downsample_scale=args.downsample_scale,
-        make_zip=args.zip,
+        print_tre=args.print_tre,
     )
