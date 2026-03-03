@@ -32,7 +32,7 @@ class TrainConfig:
     popsize: int = 12
     num_iters: int = 40
     mutation_sigma: float = 0.05
-    out_dir: Path = Path("/data/vedant/MIND/outputs/evotorch")
+    out_dir: Path = Path("/data/vedant/MIND/outputs/lungct")
     model_name: str = "basic"
     model_params: dict = None
     feature_mode: str = "learned"
@@ -42,10 +42,50 @@ class TrainConfig:
     parenthood_ratio: float = 0.25
     dataset: str = "lungct"
     dataset_root: Path | None = None
+    pair_list_csv: Path | None = None
+    cc_kernel_size: int | None = None
+    smooth_warp_sigma: float | None = None
+    smooth_grad_sigma: float | None = None
 
 
 def _build_model(model_name: str, params: dict | None) -> tuple[torch.nn.Module, List[dict], str]:
     return build_model(model_name, params)
+
+
+def _resolve_reg_cfg_from_hparam_summary(cfg: TrainConfig) -> GreedyRegConfig:
+    # Legacy defaults as fallback.
+    cc = int(GreedyRegConfig.cc_kernel_size)
+    sw = float(GreedyRegConfig.smooth_warp_sigma)
+    sg = float(GreedyRegConfig.smooth_grad_sigma)
+
+    summary_path = cfg.root / "benchmarks" / cfg.dataset / "hparam_search" / "summary.csv"
+    if summary_path.exists():
+        with summary_path.open("r", newline="") as f:
+            row = next(csv.DictReader(f), None)
+        if row is not None:
+            cc = int(row["cc_width"])
+            sw = float(row["sigma_warp"])
+            sg = float(row["sigma_grad"])
+            print(f"[PARAMS] Loaded defaults from {summary_path}")
+        else:
+            print(f"[PARAMS] Empty summary at {summary_path}; using legacy defaults")
+    else:
+        print(f"[PARAMS] Summary not found at {summary_path}; using legacy defaults")
+
+    if cfg.cc_kernel_size is not None:
+        cc = int(cfg.cc_kernel_size)
+    if cfg.smooth_warp_sigma is not None:
+        sw = float(cfg.smooth_warp_sigma)
+    if cfg.smooth_grad_sigma is not None:
+        sg = float(cfg.smooth_grad_sigma)
+    print(f"[PARAMS] cc_kernel_size={cc} smooth_warp_sigma={sw} smooth_grad_sigma={sg}")
+
+    return GreedyRegConfig(
+        loss_type="cc",
+        cc_kernel_size=cc,
+        smooth_warp_sigma=sw,
+        smooth_grad_sigma=sg,
+    )
 
 
 def _fitness_factory(
@@ -103,6 +143,7 @@ def run_training(cfg: TrainConfig) -> None:
 
     use_gpu_eval = torch.cuda.is_available()
     device = "cuda" if use_gpu_eval else "cpu"
+    reg_cfg = _resolve_reg_cfg_from_hparam_summary(cfg)
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     with (cfg.out_dir / "run_config.json").open("w") as f:
         json.dump(
@@ -124,24 +165,35 @@ def run_training(cfg: TrainConfig) -> None:
                 "parenthood_ratio": cfg.parenthood_ratio,
                 "dataset": cfg.dataset,
                 "dataset_root": str(cfg.dataset_root) if cfg.dataset_root else None,
+                "pair_list_csv": str(cfg.pair_list_csv) if cfg.pair_list_csv else None,
                 "device": device,
                 "use_gpu_eval": use_gpu_eval,
                 "num_actors": "num_gpus" if use_gpu_eval else 0,
                 "num_gpus_per_actor": 1 if use_gpu_eval else None,
                 "model_config": str(cfg.out_dir / "model_config.json"),
                 "reg_cfg": {
-                    "scales": list(GreedyRegConfig.scales),
-                    "iterations": list(GreedyRegConfig.iterations),
+                    "scales": list(reg_cfg.scales),
+                    "iterations": list(reg_cfg.iterations),
                     "loss_type": "cc",
-                    "cc_kernel_size": GreedyRegConfig.cc_kernel_size,
-                    "smooth_warp_sigma": GreedyRegConfig.smooth_warp_sigma,
-                    "smooth_grad_sigma": GreedyRegConfig.smooth_grad_sigma,
+                    "cc_kernel_size": reg_cfg.cc_kernel_size,
+                    "smooth_warp_sigma": reg_cfg.smooth_warp_sigma,
+                    "smooth_grad_sigma": reg_cfg.smooth_grad_sigma,
                 },
             },
             f,
             indent=2,
         )
-    pairs = build_pairs(cfg.root, dataset=cfg.dataset, dataset_root=cfg.dataset_root)
+    pairs = build_pairs(
+        cfg.root,
+        dataset=cfg.dataset,
+        dataset_root=cfg.dataset_root,
+        pair_list_csv=cfg.pair_list_csv,
+    )
+    if len(pairs) < 2:
+        raise ValueError(
+            f"Need at least 2 pairs after filtering, got {len(pairs)}. "
+            "Increase subset size or disable --pair-list-csv."
+        )
     train_pairs, test_pairs = split_pairs(pairs, seed=cfg.seed, test_frac=cfg.test_frac)
 
     model, model_cfgs, model_name = _build_model(cfg.model_name, cfg.model_params or {})
@@ -171,6 +223,7 @@ def run_training(cfg: TrainConfig) -> None:
                 "parenthood_ratio": cfg.parenthood_ratio,
                 "dataset": cfg.dataset,
                 "dataset_root": str(cfg.dataset_root) if cfg.dataset_root else None,
+                "pair_list_csv": str(cfg.pair_list_csv) if cfg.pair_list_csv else None,
                 "model_class": model.__class__.__name__,
                 "blocks": model_cfgs,
             },
@@ -178,7 +231,6 @@ def run_training(cfg: TrainConfig) -> None:
             indent=2,
         )
 
-    reg_cfg = GreedyRegConfig(loss_type="cc")
     fitness = _fitness_factory(
         model, train_pairs, device, cfg.masked, reg_cfg, use_gpu_eval, cfg.feature_mode
     )
@@ -352,6 +404,30 @@ def main() -> None:
         default=None,
         help="Optional dataset root override (for NLST, default is /mnt/rohit_data2/NLST/NLST)",
     )
+    parser.add_argument(
+        "--pair-list-csv",
+        type=Path,
+        default=None,
+        help="Optional CSV with columns case,fixed_image,moving_image to train on a subset",
+    )
+    parser.add_argument(
+        "--cc-kernel-size",
+        type=int,
+        default=None,
+        help="Override cc kernel size (default from benchmarks/<dataset>/hparam_search/summary.csv)",
+    )
+    parser.add_argument(
+        "--smooth-warp-sigma",
+        type=float,
+        default=None,
+        help="Override smooth_warp_sigma (default from benchmarks/<dataset>/hparam_search/summary.csv)",
+    )
+    parser.add_argument(
+        "--smooth-grad-sigma",
+        type=float,
+        default=None,
+        help="Override smooth_grad_sigma (default from benchmarks/<dataset>/hparam_search/summary.csv)",
+    )
     args = parser.parse_args()
 
     cfg = TrainConfig()
@@ -369,7 +445,7 @@ def main() -> None:
     prefix = "masked" if masked else "unmasked"
     base = f"{prefix}_{args.model}"
     out_name = f"{base}_{suffix}" if suffix else base
-    out_dir = Path(f"/data/vedant/MIND/outputs/evotorch/{out_name}")
+    out_dir = Path(f"/data/vedant/MIND/outputs/{args.dataset}/{out_name}")
     cfg = TrainConfig(
         masked=masked,
         out_dir=out_dir,
@@ -382,6 +458,10 @@ def main() -> None:
         parenthood_ratio=float(args.parenthood_ratio),
         dataset=args.dataset,
         dataset_root=args.dataset_root,
+        pair_list_csv=args.pair_list_csv,
+        cc_kernel_size=args.cc_kernel_size,
+        smooth_warp_sigma=args.smooth_warp_sigma,
+        smooth_grad_sigma=args.smooth_grad_sigma,
     )
     run_training(cfg)
 

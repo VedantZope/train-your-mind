@@ -95,7 +95,6 @@ def run_export(
     smooth_warp_sigma: float,
     smooth_grad_sigma: float,
     downsample_scale: int,
-    print_tre: bool,
 ) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -106,6 +105,7 @@ def run_export(
         if model_weights is None:
             raise ValueError("--model-weights is required when --feature-mode learned")
         model = _load_model_from_weights(model_weights).to(device).eval()
+    tre_rows: list[tuple[str, str, str, float, float]] = []
 
     for idx, pair in enumerate(pairs, start=1):
         (
@@ -121,7 +121,7 @@ def run_export(
             raise FileNotFoundError(
                 f"Image file missing for pair {pair}: {fixed_path} / {moving_path}"
             )
-        if print_tre and (not fixed_kp_path.exists() or not moving_kp_path.exists()):
+        if not fixed_kp_path.exists() or not moving_kp_path.exists():
             print(
                 f"[WARN] Missing keypoints for TRE print: {fixed_kp_path} / {moving_kp_path}"
             )
@@ -169,8 +169,11 @@ def run_export(
         )
         reg.optimize()
 
-        tre_suffix = ""
-        if print_tre and fixed_kp_path is not None and moving_kp_path is not None:
+        fixed_case4 = _extract_case4(pair["fixed"])
+        moving_case4 = _extract_case4(pair["moving"])
+
+        tre_suffix = " | TRE unavailable (no keypoints for this split/pair)"
+        if fixed_kp_path is not None and moving_kp_path is not None:
             fixed_pts = load_keypoints_csv(fixed_kp_path).astype("float32")
             moving_pts = load_keypoints_csv(moving_kp_path).astype("float32")
             fixed_kp = Keypoints(fixed_pts, fixed_img, device=device, space="pixel")
@@ -185,11 +188,10 @@ def run_export(
                 moved_kp_batch, moving_kp_batch, space="physical", reduction="mean"
             ).item()
             tre_suffix = f" | TRE init={initial_dist:.4f} final={final_dist:.4f}"
-        elif print_tre:
-            tre_suffix = " | TRE unavailable (no keypoints for this split/pair)"
+            tre_rows.append(
+                (f"NLST_{fixed_case4}", fixed_path.name, moving_path.name, initial_dist, final_dist)
+            )
 
-        fixed_case4 = _extract_case4(pair["fixed"])
-        moving_case4 = _extract_case4(pair["moving"])
         out_name = f"disp_{fixed_case4}_{moving_case4}.nii.gz"
         out_path = out_dir / out_name
 
@@ -200,6 +202,21 @@ def run_export(
         )
 
         print(f"[{idx}/{len(pairs)}] saved {out_path.name}{tre_suffix}")
+
+    if tre_rows:
+        mean_initial = sum(r[3] for r in tre_rows) / len(tre_rows)
+        mean_final = sum(r[4] for r in tre_rows) / len(tre_rows)
+        print("\n=== TRE Summary (mm) ===")
+        print(f"Pairs with keypoints: {len(tre_rows)} / {len(pairs)}")
+        print(f"Mean initial TRE: {mean_initial:.6f}")
+        print(f"Mean final TRE:   {mean_final:.6f}")
+        print("\n=== TRE Table ===")
+        print("case,fixed_image,moving_image,dist_initial_physical,dist_final_physical")
+        for case_id, fixed_name, moving_name, initial_dist, final_dist in tre_rows:
+            print(f"{case_id},{fixed_name},{moving_name},{initial_dist:.6f},{final_dist:.6f}")
+    else:
+        print("\n=== TRE Summary (mm) ===")
+        print("No keypoint pairs found; TRE table is unavailable.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export NLST Learn2Reg submission fields")
@@ -249,11 +266,6 @@ if __name__ == "__main__":
     parser.add_argument("--smooth-warp-sigma", type=float, default=0.943661231295491)
     parser.add_argument("--smooth-grad-sigma", type=float, default=3.977854595777292)
     parser.add_argument("--downsample-scale", type=int, default=1)
-    parser.add_argument(
-        "--print-tre",
-        action="store_true",
-        help="Print per-pair initial/final TRE in terminal when keypoints are available",
-    )
     args = parser.parse_args()
 
     dataset_json = args.dataset_json or (args.nlst_root / "NLST_dataset.json")
@@ -273,5 +285,4 @@ if __name__ == "__main__":
         smooth_warp_sigma=args.smooth_warp_sigma,
         smooth_grad_sigma=args.smooth_grad_sigma,
         downsample_scale=args.downsample_scale,
-        print_tre=args.print_tre,
     )
