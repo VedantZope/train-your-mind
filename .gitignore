@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+*.swp
+*.swo
+
+# Local large datasets and artifacts
+data/
+outputs/
+images/
+infer/results/
+
+# Benchmarks: ignore generated outputs, keep scripts + summary
+benchmarks/*
+!benchmarks/scripts/
+!benchmarks/scripts/**
+!benchmarks/summary.md
+
+# Optional local notes/notebooks (uncomment if desired)
+# notebooks/
+# notes/
