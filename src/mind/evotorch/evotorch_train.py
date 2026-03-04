@@ -10,7 +10,7 @@ import csv
 import json
 
 from mind.evotorch.data import build_pairs, split_pairs
-from mind.evotorch.fireants_eval import GreedyRegConfig, evaluate_pairs
+from mind.evotorch.fireants_eval import EvalStats, GreedyRegConfig, evaluate_pairs, evaluate_pairs_stats
 from mind.evotorch.model import build_model
 from mind.evotorch.weights import flatten_params, set_params_from_vector
 import logging
@@ -46,6 +46,8 @@ class TrainConfig:
     cc_kernel_size: int | None = None
     smooth_warp_sigma: float | None = None
     smooth_grad_sigma: float | None = None
+    heatmap_dice_weight: float = 0.0
+    keypoint_patch_radius_vox: int = 1
 
 
 def _build_model(model_name: str, params: dict | None) -> tuple[torch.nn.Module, List[dict], str]:
@@ -96,6 +98,8 @@ def _fitness_factory(
     reg_cfg: GreedyRegConfig,
     use_gpu_eval: bool,
     feature_mode: str,
+    heatmap_dice_weight: float,
+    keypoint_patch_radius_vox: int,
 ):
     state = {"eval_id": 0}
 
@@ -118,6 +122,8 @@ def _fitness_factory(
             feature_mode=feature_mode,
             log_prefix=f"[EVAL {state['eval_id']}] ",
             log_every=1,
+            heatmap_dice_weight=heatmap_dice_weight,
+            keypoint_patch_radius_vox=keypoint_patch_radius_vox,
         )
         del x
         _cleanup_memory(use_gpu_eval)
@@ -179,6 +185,8 @@ def run_training(cfg: TrainConfig) -> None:
                     "smooth_warp_sigma": reg_cfg.smooth_warp_sigma,
                     "smooth_grad_sigma": reg_cfg.smooth_grad_sigma,
                 },
+                "heatmap_dice_weight": cfg.heatmap_dice_weight,
+                "keypoint_patch_radius_vox": cfg.keypoint_patch_radius_vox,
             },
             f,
             indent=2,
@@ -224,6 +232,8 @@ def run_training(cfg: TrainConfig) -> None:
                 "dataset": cfg.dataset,
                 "dataset_root": str(cfg.dataset_root) if cfg.dataset_root else None,
                 "pair_list_csv": str(cfg.pair_list_csv) if cfg.pair_list_csv else None,
+                "heatmap_dice_weight": cfg.heatmap_dice_weight,
+                "keypoint_patch_radius_vox": cfg.keypoint_patch_radius_vox,
                 "model_class": model.__class__.__name__,
                 "blocks": model_cfgs,
             },
@@ -232,7 +242,15 @@ def run_training(cfg: TrainConfig) -> None:
         )
 
     fitness = _fitness_factory(
-        model, train_pairs, device, cfg.masked, reg_cfg, use_gpu_eval, cfg.feature_mode
+        model,
+        train_pairs,
+        device,
+        cfg.masked,
+        reg_cfg,
+        use_gpu_eval,
+        cfg.feature_mode,
+        cfg.heatmap_dice_weight,
+        cfg.keypoint_patch_radius_vox,
     )
 
     problem = Problem(
@@ -269,7 +287,17 @@ def run_training(cfg: TrainConfig) -> None:
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     with metrics_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["generation", "best_train_mean", "test_mean"])
+        writer.writerow(
+            [
+                "generation",
+                "best_train_mean",
+                "test_mean",
+                "best_train_tre",
+                "best_train_dice_loss",
+                "test_tre",
+                "test_dice_loss",
+            ]
+        )
 
         for gen in range(1, cfg.num_iters + 1):
             print(f"[GEN {gen}/{cfg.num_iters}] start")
@@ -282,27 +310,43 @@ def run_training(cfg: TrainConfig) -> None:
             if str(next(model.parameters()).device) != eval_device:
                 model.to(eval_device)
             set_params_from_vector(model, best_values)
-            train_score = evaluate_pairs(
+            train_stats: EvalStats = evaluate_pairs_stats(
                 model,
                 train_pairs,
                 device=eval_device,
                 masked=cfg.masked,
                 reg_cfg=reg_cfg,
                 feature_mode=cfg.feature_mode,
+                heatmap_dice_weight=cfg.heatmap_dice_weight,
+                keypoint_patch_radius_vox=cfg.keypoint_patch_radius_vox,
             )
-            test_score = evaluate_pairs(
+            test_stats: EvalStats = evaluate_pairs_stats(
                 model,
                 test_pairs,
                 device=eval_device,
                 masked=cfg.masked,
                 reg_cfg=reg_cfg,
                 feature_mode=cfg.feature_mode,
+                heatmap_dice_weight=cfg.heatmap_dice_weight,
+                keypoint_patch_radius_vox=cfg.keypoint_patch_radius_vox,
             )
             print(
-                f"[GEN {gen}/{cfg.num_iters}] best_train_mean={train_score:.4f} "
-                f"test_mean={test_score:.4f}"
+                f"[GEN {gen}/{cfg.num_iters}] best_train_mean={train_stats.mean_objective:.4f} "
+                f"test_mean={test_stats.mean_objective:.4f} "
+                f"train_tre={train_stats.mean_tre:.4f} test_tre={test_stats.mean_tre:.4f} "
+                f"train_dice_loss={train_stats.mean_dice_loss:.4f} test_dice_loss={test_stats.mean_dice_loss:.4f}"
             )
-            writer.writerow([gen, train_score, test_score])
+            writer.writerow(
+                [
+                    gen,
+                    train_stats.mean_objective,
+                    test_stats.mean_objective,
+                    train_stats.mean_tre,
+                    train_stats.mean_dice_loss,
+                    test_stats.mean_tre,
+                    test_stats.mean_dice_loss,
+                ]
+            )
             f.flush()
 
             weights_path = checkpoints_dir / f"{gen:03d}.pt"
@@ -319,15 +363,20 @@ def run_training(cfg: TrainConfig) -> None:
     if str(next(model.parameters()).device) != eval_device:
         model.to(eval_device)
     set_params_from_vector(model, best_values)
-    test_score = evaluate_pairs(
+    test_stats = evaluate_pairs_stats(
         model,
         test_pairs,
         device=eval_device,
         masked=cfg.masked,
         reg_cfg=reg_cfg,
         feature_mode=cfg.feature_mode,
+        heatmap_dice_weight=cfg.heatmap_dice_weight,
+        keypoint_patch_radius_vox=cfg.keypoint_patch_radius_vox,
     )
-    print(f"Test mean distance: {test_score}")
+    print(
+        f"Test objective={test_stats.mean_objective:.6f} "
+        f"(TRE={test_stats.mean_tre:.6f}, dice_loss={test_stats.mean_dice_loss:.6f})"
+    )
     del best_values, best
     _cleanup_memory(use_gpu_eval)
 
@@ -428,6 +477,18 @@ def main() -> None:
         default=None,
         help="Override smooth_grad_sigma (default from benchmarks/<dataset>/hparam_search/summary.csv)",
     )
+    parser.add_argument(
+        "--heatmap-dice-weight",
+        type=float,
+        default=0.0,
+        help="Weight for auxiliary keypoint patch Dice loss term in GA objective",
+    )
+    parser.add_argument(
+        "--keypoint-patch-radius-vox",
+        type=int,
+        default=1,
+        help="Radius for keypoint patch masks (1 => 3x3x3)",
+    )
     args = parser.parse_args()
 
     cfg = TrainConfig()
@@ -462,6 +523,8 @@ def main() -> None:
         cc_kernel_size=args.cc_kernel_size,
         smooth_warp_sigma=args.smooth_warp_sigma,
         smooth_grad_sigma=args.smooth_grad_sigma,
+        heatmap_dice_weight=float(args.heatmap_dice_weight),
+        keypoint_patch_radius_vox=int(args.keypoint_patch_radius_vox),
     )
     run_training(cfg)
 

@@ -10,8 +10,9 @@ from fireants.io.imagemask import apply_mask_to_image
 from fireants.io.keypoints import BatchedKeypoints, Keypoints, compute_keypoint_distance
 from fireants.registration.greedy import GreedyRegistration
 
-from mind.utils.io import image_from_tensor_like, load_keypoints_csv, mind_descriptor_image_convex
 from mind.evotorch.data import PairSample
+from mind.utils.io import image_from_tensor_like, load_keypoints_csv, mind_descriptor_image_convex
+from mind.utils.keypoint_masks import keypoints_to_patch_mask
 import logging
 
 logging.getLogger("fireants").setLevel(logging.WARNING)
@@ -28,11 +29,36 @@ class GreedyRegConfig:
     smooth_grad_sigma: float = 3.6329020170516038
 
 
+@dataclass(frozen=True)
+class EvalStats:
+    mean_objective: float
+    mean_tre: float
+    mean_dice_loss: float
+
+
 def _to_feature_image(src_img: Image, feat_tensor: torch.Tensor) -> Image:
     return image_from_tensor_like(src_img, feat_tensor)
 
 
-def evaluate_pairs(
+def _dice_from_keypoint_patches(
+    moved_fixed_pts: torch.Tensor,
+    moving_pts: torch.Tensor,
+    spatial_shape: tuple[int, int, int],
+    patch_radius_vox: int,
+) -> float:
+    moved_np = moved_fixed_pts.detach().cpu().numpy()
+    moving_np = moving_pts.detach().cpu().numpy()
+    moved_mask = keypoints_to_patch_mask(spatial_shape, moved_np, radius_vox=patch_radius_vox)
+    moving_mask = keypoints_to_patch_mask(spatial_shape, moving_np, radius_vox=patch_radius_vox)
+    moved_t = torch.from_numpy(moved_mask).float()
+    moving_t = torch.from_numpy(moving_mask).float()
+    inter = torch.sum(moved_t * moving_t)
+    denom = torch.sum(moved_t) + torch.sum(moving_t)
+    dice = (2.0 * inter + 1e-6) / (denom + 1e-6)
+    return float(dice.item())
+
+
+def evaluate_pairs_stats(
     model: torch.nn.Module,
     pairs: Iterable[PairSample],
     device: str,
@@ -41,12 +67,16 @@ def evaluate_pairs(
     feature_mode: str = "learned",
     log_prefix: str = "",
     log_every: int = 0,
-) -> float:
+    heatmap_dice_weight: float = 0.0,
+    keypoint_patch_radius_vox: int = 1,
+) -> EvalStats:
     model.eval()
     model_device = next(model.parameters()).device
     if str(model_device) != device:
         model.to(device)
     dists: List[float] = []
+    dice_losses: List[float] = []
+    objectives: List[float] = []
     pair_list = list(pairs)
     total_pairs = len(pair_list)
 
@@ -123,8 +153,29 @@ def evaluate_pairs(
                 moved_kp_batch, moving_kp_batch, space="physical", reduction="mean"
             ).item()
             dists.append(final_dist)
+
+            dice_loss = 0.0
+            if heatmap_dice_weight > 0.0:
+                moved_pts_px = moved_kp_batch.as_pixel_coordinates()[0]
+                moving_pts_px = moving_kp_batch.as_pixel_coordinates()[0]
+                spatial_shape = tuple(int(x) for x in moving_img.array.shape[-3:])
+                dice = _dice_from_keypoint_patches(
+                    moved_pts_px,
+                    moving_pts_px,
+                    spatial_shape=spatial_shape,
+                    patch_radius_vox=keypoint_patch_radius_vox,
+                )
+                dice_loss = 1.0 - dice
+            dice_losses.append(dice_loss)
+
+            objective = final_dist + (heatmap_dice_weight * dice_loss)
+            objectives.append(objective)
+
             if log_every > 0 and idx % log_every == 0:
-                print(f"{log_prefix}pair {idx}/{total_pairs} dist={final_dist:.4f}")
+                print(
+                    f"{log_prefix}pair {idx}/{total_pairs} "
+                    f"tre={final_dist:.4f} dice_loss={dice_loss:.4f} obj={objective:.4f}"
+                )
         finally:
             del moved_kp_batch
             del reg
@@ -138,4 +189,35 @@ def evaluate_pairs(
             if device == "cuda":
                 torch.cuda.empty_cache()
 
-    return float(sum(dists) / max(1, len(dists)))
+    return EvalStats(
+        mean_objective=float(sum(objectives) / max(1, len(objectives))),
+        mean_tre=float(sum(dists) / max(1, len(dists))),
+        mean_dice_loss=float(sum(dice_losses) / max(1, len(dice_losses))),
+    )
+
+
+def evaluate_pairs(
+    model: torch.nn.Module,
+    pairs: Iterable[PairSample],
+    device: str,
+    masked: bool,
+    reg_cfg: GreedyRegConfig,
+    feature_mode: str = "learned",
+    log_prefix: str = "",
+    log_every: int = 0,
+    heatmap_dice_weight: float = 0.0,
+    keypoint_patch_radius_vox: int = 1,
+) -> float:
+    stats = evaluate_pairs_stats(
+        model=model,
+        pairs=pairs,
+        device=device,
+        masked=masked,
+        reg_cfg=reg_cfg,
+        feature_mode=feature_mode,
+        log_prefix=log_prefix,
+        log_every=log_every,
+        heatmap_dice_weight=heatmap_dice_weight,
+        keypoint_patch_radius_vox=keypoint_patch_radius_vox,
+    )
+    return stats.mean_objective
